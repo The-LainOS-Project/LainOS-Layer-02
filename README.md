@@ -1,3 +1,11 @@
+# lainOS layer 02 (Protocol 7)
+
+> A systemd-free Arch Linux derivative built with OpenRC as PID 1, offering full ABI compatibility for systemd-linked software via the Protocol 7 compatibility architecture, split-controller DNS mediation, and full OpenRC service isolation/containment.
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Architecture](https://img.shields.io/badge/Arch-x86__64-blue)](https://archlinux.org)
+[![Init](https://img.shields.io/badge/Init-OpenRC-green)](https://github.com/OpenRC/openrc)
+
 <!--Reddit-->
 <a href="https://www.reddit.com/r/LainOSdevelopers/" target="_blank">
   <img align="top" src="https://img.shields.io/badge/Reddit-FF4500?style=for-the-badge&logo=reddit&logoColor=white" alt="Reddit">
@@ -18,16 +26,6 @@
 <a href="https://forgejo.lain.rocks/lainOS" target="_blank">
   <img align="top" src="https://img.shields.io/badge/Forgejo-ff6600?style=for-the-badge&logo=forgejo&logoColor=white" alt="Forgejo">
 </a>
-
-# lainOS layer 02
-
-Available at https://forgejo.lain.rocks/lainOS/lainOS-layer-02/releases
-
-> A systemd-free Arch Linux derivative built with OpenRC as PID 1, offering full ABI compatibility for systemd-linked software via the Protocol 7 compatibility architecture.
-
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Architecture](https://img.shields.io/badge/Arch-x86__64-blue)](https://archlinux.org)
-[![Init](https://img.shields.io/badge/Init-OpenRC-green)](https://github.com/OpenRC/openrc)
 
 ---
 
@@ -120,6 +118,7 @@ BIOS/UEFI ~ GRUB/Syslinux ~ kernel + initramfs
 - **PipeWire** audio, bundled by default (`pipewire`, `pipewire-pulse`, `pipewire-alsa`, `pipewire-jack`); `lainos-audio-init` orchestrates startup
 
 ### System Hardening
+- **OpenRC service isolation/containment stack** ~ written in rust. covers full network stack, seatd/greetd isolation coming soon.
 - **Protocol 7 Core fuzz tested** ~ dfuzzer 2.6 full interface PASS, AddressSanitizer PASS, libFuzzer 2M+ iterations PASS on lainos-notifyd; two purpose-built libFuzzer harnesses on lainos-init's environment-driven exec logic, 9M+ combined executions, zero crashes
 - **Manual security review, not just automated tooling** ~ a logic-focused code review of lainos-dbus-bridge found and fixed a missing caller-identity check on Reboot/PowerOff D-Bus methods (tested and confirmed not independently exploitable given the existing privilege model, fixed anyway as defense-in-depth)
 - **Seccomp hardening modeled on Whonix/Kicksecure's systemd sandboxing directives** ~ `socket()` restricted to `AF_UNIX` only (RestrictAddressFamilies equivalent); `personality()`/`unshare()`/`setns()` confirmed blocked by the existing default-deny policy (LockPersonality/RestrictNamespaces equivalents)
@@ -388,6 +387,106 @@ Protocol 7 Core has been fuzz tested and hardened:
 
 ## System Hardening
 
+## 🧩 OpenRC Service Isolation & Containment Stack
+
+Layer 02 ships with an **OpenRC-native service isolation stack** that provides systemd-equivalent containment (`ProtectSystem=`, `PrivateTmp=`, capability bounding, resource limits, syscall filtering) without systemd, without compatibility layers, and without forking OpenRC.
+
+The stack composes four kernel primitives per service, driven by declarative `rc_*` variables in `/etc/conf.d/<service>`:
+
+| Layer | Mechanism | What It Does |
+|-------|-----------|--------------|
+| **Namespace isolation** | bwrap | Mount/PID/network namespace isolation and filesystem containment |
+| **Resource limits** | cgroup-v2 | Memory, CPU, and process-count ceilings (`rc_memory_max`, `rc_cpu_quota`, `rc_pids_max`) |
+| **Syscall filtering** | seccomp-bpf | Per-service syscall allowlisting (`rc_seccomp_profile`) |
+| **Path enforcement** | Landlock LSM | LSM-level path restriction that survives a namespace escape (`rc_landlock_ro`, `rc_landlock_rw`) |
+
+Both `rc-sandbox` and `lainos-sandbox-wrap` are written in **Rust** and compiled to statically-linked, memory-safe binaries. No shell scripts or interpreted code exist in the isolation chain between OpenRC and the target service.
+
+### Default Behavior
+
+All lainOS-shipped services are **sandboxed by default**. A service runs unsandboxed only if explicitly opted out:
+
+```bash
+# /etc/conf.d/<service>
+rc_sandbox="NO"   # Opt out of all isolation
+```
+
+### Service Coverage
+
+The following core services run inside the isolation stack with per-service profiles:
+
+| Service | Seccomp Profile | PID Namespace | Network | Foreground Required |
+|---------|-----------------|---------------|---------|---------------------|
+| `dnsmasq` | `lainos-network` | Isolated | Host | Yes (`--keep-in-foreground`) |
+| `unbound` | `lainos-network` | Isolated | Host | Yes (`-d`) |
+| `dnscrypt-proxy` | `lainos-network` | Isolated | Host | Yes (default) |
+| `tor` | `lainos-network` | Isolated | Host | Yes (`--RunAsDaemon 0`) |
+| `dhcpcd` | `lainos-privileged` | **Host** | Host | No (`rc_unshare_pid="NO"`) |
+| `chrony` | `lainos-privileged` | **Host** | Host | Yes (`-d`) |
+| `syslog-ng` | `lainos-base` | Isolated | **Isolated** | Yes (`-F`) |
+| `acpid` | `lainos-base` | Isolated | Host | No |
+| `iwd` | `lainos-privileged` | Isolated | Host | No |
+
+### Declarative Service Configuration
+
+Service isolation is configured entirely through variables in `/etc/conf.d/<service>`:
+
+```bash
+# /etc/conf.d/dnsmasq
+rc_private_tmp="YES"                    # Private /tmp
+rc_protect_home="YES"                   # Hide /home and /root
+rc_protect_system="STRICT"              # Read-only /usr and /boot
+rc_capability_bounding_set="CAP_NET_BIND_SERVICE,CAP_NET_RAW"
+rc_memory_max="256M"                    # Memory limit
+rc_pids_max="20"                        # Process count limit
+rc_seccomp_profile="lainos-network"     # Syscall allowlist
+rc_network_access="YES"                 # Host network namespace
+rc_unshare_pid="YES"                    # Isolated PID namespace (foreground required)
+```
+
+### Verification
+
+`openrc-security-status` verifies every layer at runtime:
+
+```bash
+doas openrc-security-status
+```
+
+Example output:
+
+```
+=== dnsmasq ===
+  process               running as PID 8606 (comm=dnsmasq)
+  namespace: mount      ISOLATED (own mount ns)
+  namespace: network    shared with host (rc_network_access=YES, correct)
+  namespace: pid        ISOLATED (own PID namespace)
+  cgroup limits         ENFORCED (memory.max=67108864 pids.max=20)
+  seccomp-bpf           ACTIVE (filter mode, 1 filter(s) loaded, no_new_privs set)
+  capabilities          NARROWED (CapEff=0x0000000000002400 CapBnd=0x00000000000024c3)
+  AppArmor              CONFINED (/usr/bin/dnsmasq)
+```
+
+### Failure Behavior
+
+| Layer | Failure Mode | Rationale |
+|-------|--------------|-----------|
+| bwrap | **Hard failure** ~ service does not start | Primary containment layer |
+| seccomp-bpf | **Hard failure** ~ service does not start | Primary containment layer |
+| no_new_privs | **Hard failure** ~ service does not start | Closes setuid-based seccomp bypass |
+| cgroup-v2 | **Soft failure** ~ service starts with warning | Hardening layer |
+| Landlock | **Soft failure** ~ service starts with warning | Backstop layer |
+
+### Security Properties
+
+- **Services are sandboxed by default** ~ opt-out, not opt-in
+- **Four independent layers** ~ failure of one does not compromise the others
+- **Landlock backstop** ~ LSM-level path enforcement survives a namespace escape (systemd does not have this)
+- **Runtime verification** ~ `openrc-security-status` confirms every layer is active and enforcing
+- **Rust implementation** ~ memory-safe, statically-linked, no shell scripts in the critical path
+- **AppArmor complement** ~ independent path-based MAC layer on top of namespace isolation
+
+---
+
 ### Kernel Parameters
 
 `GRUB_CMDLINE_LINUX`:
@@ -514,23 +613,129 @@ LUKS encryption is supported and confirmed working via Calamares (opt-in at inst
 
 ## Network Configuration
 
-### DNS
+### DNS Mediation Architecture
 
-LainOS uses a centralized DNS mediation architecture: all applications resolve through `127.0.0.1:53` (dnsmasq), which forwards to the appropriate upstream based on mode. The operating system controls resolver policy; applications require no configuration changes.
+LainOS provides a localized, stateless DNS forwarding architecture built around `dnsmasq`. Rather than exposing upstream resolver information directly to applications, the operating system presents a single, stable resolver endpoint (`127.0.0.1:53`) and centralizes DNS policy within a dedicated forwarding layer.
 
-**Modes:**
-- **Plaintext** (default) ~ DHCP-provided resolver with fallbacks to 1.1.1.1/9.9.9.9
-- **Encrypted** ~ `dnsmasq` → `unbound` (`127.0.0.1:5053`, DNSSEC validation + caching) → `dnscrypt-proxy` (`127.0.0.1:5300`, wire encryption + anonymized relay routing) (`lainos-dns encrypted`). No single component in the chain sees both the user's IP and the query. `stubby` is used automatically instead of `unbound` if `unbound` is not installed.
-- **Private** ~ Tor DNSPort on `127.0.0.1:9059` (`private-mode on`)
+Applications never communicate directly with upstream DNS servers. The resolver architecture remains identical regardless of operational mode; only the forwarding destination changes.
 
-Mode transitions are explicit and stateful; `private-mode` remembers and restores your previous mode (plaintext or encrypted) on exit, and both `lainos-dns` and `private-mode` wait for an actual network route (not just an interface being "up") before attempting to bootstrap the encrypted chain ~ important on WiFi, where reconnecting via `wscan` after a radio toggle isn't instantaneous.
+### Architecture
+
+All DNS resolution follows a single deterministic path:
+
+```
+                +----------------------+
+                |   Local Application  |
+                +----------+-----------+
+                           |
+                           v
+                    /etc/resolv.conf
+                           |
+                           v
+                      127.0.0.1:53
+                           |
+                           v
+                        dnsmasq
+                           |
+               +-----------+-----------+-----------+
+               |                       |           |
+               |                       |           |
+         Plaintext Mode          Encrypted Mode  Private Mode
+               |                       |           |
+               v                       v           v
+     DHCP / Manual Fallback     Local Proxy    Tor DNSPort
+     (1.1.1.1, 9.9.9.9)        (127.0.0.1:5053)  (9059)
+                                  |
+                                  v
+                               unbound
+                           (127.0.0.1:5053)
+                                  |
+                                  v
+                            dnscrypt-proxy
+                           (127.0.0.1:5300)
+                                  |
+                    +-------------+-------------+
+                    |                           |
+                    v                           v
+              Anonymized Relay              Resolver
+              (IP hiding)              (DNSCrypt, no-log)
+```
+
+### Stateless Forwarding
+
+`dnsmasq` operates as a forwarding resolver rather than a caching resolver:
+
+```
+cache-size=0
+no-negcache
+```
+
+This intentionally avoids retaining successful or negative DNS query history in memory. All caching, prefetching, and TTL management is delegated to `unbound`. If compromised, `dnsmasq` leaks no historical query data.
+
+The resolver is bound exclusively to the loopback interface and is never exposed externally.
+
+### Operational Modes
+
+| Mode | Description | Activation |
+|------|-------------|------------|
+| **Plaintext** (Default) | DHCP-provided resolver with fallbacks to 1.1.1.1/9.9.9.9 | `lainos-dns plaintext` |
+| **Encrypted** | `dnsmasq` → `unbound` (DNSSEC, caching) → `dnscrypt-proxy` (encrypted transport, anonymized relay) | `lainos-dns encrypted` |
+| **Private** | All DNS through Tor's DNSPort (127.0.0.1:9059) | `private-mode on` |
+
+### Split-Controller Privacy in Encrypted Mode
+
+In encrypted mode, the DNS chain splits responsibilities so no single component sees both the user's IP and their plaintext query:
+
+- **`dnsmasq`** — sees the user's IP but has no cache and no query history
+- **`unbound`** — validates DNSSEC, caches, and forwards to dnscrypt-proxy; does not see the user's IP
+- **`dnscrypt-proxy`** — encrypts and routes through an anonymized relay; sees neither the query nor the user's IP
+- **Relay** — knows the user's IP but not the query
+- **Resolver** — knows the query but not the user's IP
+
+This is a stronger privacy model than direct DoT or DoH to a single provider, where one entity sees both.
+
+### Mode Transitions
+
+The `lainos-dns` utility manages transitions between plaintext and encrypted modes, persisting the active mode to `/var/lib/lainos/dns-mode`.
+
+`private-mode` saves the previous DNS mode before switching to Tor, and restores it on exit. This ensures a user who prefers encrypted DNS does not silently revert to plaintext after using private mode.
+
+### AppArmor Confinement
+
+The entire DNS forwarding layer is confined under AppArmor:
+
+- `/usr/bin/dnsmasq` — limited to loopback networking and necessary configuration paths
+- `/usr/bin/unbound` — restricted to resolver operations and cache directories
+- `/usr/bin/dnscrypt-proxy` — restricted to encrypted socket operations and relay lists
+
+These profiles reduce attack surface by limiting filesystem access, network capabilities, and system calls to only what is required for DNS forwarding operations.
+
+### Commands
 
 ```bash
 lainos-dns plaintext    # Plaintext fallbacks
-lainos-dns encrypted    # Encrypted: unbound + dnscrypt-proxy (or stubby fallback)
+lainos-dns encrypted    # Encrypted: unbound + dnscrypt-proxy
 lainos-dns private      # Tor DNSPort, via private-mode
 lainos-dns status       # Show current mode and full chain status
 ```
+
+Mode transitions are explicit and stateful; `private-mode` remembers and restores your previous mode on exit.
+
+---
+
+## Summary
+
+The DNS mediation architecture provides:
+
+- **Stateless forwarding** — `dnsmasq` has no cache and no query history
+- **Loopback isolation** — resolver never exposed externally
+- **Split-controller privacy** — no single component sees both IP and query
+- **Explicit mode transitions** — user always knows which mode is active
+- **AppArmor confinement** — all DNS daemons are AppArmor-enforced
+- **Application transparency** — applications see only `127.0.0.1:53`
+
+---
+
 
 ### WiFi (iwd)
 
